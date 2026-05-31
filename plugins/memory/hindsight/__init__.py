@@ -67,6 +67,7 @@ _PROVIDER_DEFAULT_MODELS = {
     "openrouter": "qwen/qwen3.5-9b",
     "minimax": "MiniMax-M2.7",
     "ollama": "gemma3:12b",
+    "ollama-cloud": "gemma3:12b",
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
@@ -286,6 +287,29 @@ REFLECT_SCHEMA = {
             "query": {"type": "string", "description": "The question to reflect on."},
         },
         "required": ["query"],
+    },
+}
+
+SYNC_RETAIN_SCHEMA = {
+    "name": "hindsight_sync_retain",
+    "description": (
+        "Store information to long-term memory and wait for completion. "
+        "Hindsight automatically extracts structured facts, resolves entities, "
+        "and indexes for retrieval. Use when you need to guarantee the memory "
+        "is fully stored before proceeding (e.g., before a recall that depends on it)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The information to store."},
+            "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'project decision')."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional per-call tags to merge with configured default retain tags.",
+            },
+        },
+        "required": ["content"],
     },
 }
 
@@ -848,7 +872,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "api_url", "description": "Hindsight API URL", "default": _DEFAULT_LOCAL_URL, "when": {"mode": "local_external"}},
             {"key": "api_key", "description": "API key (optional)", "secret": True, "env_var": "HINDSIGHT_API_KEY", "when": {"mode": "local_external"}},
             # Local embedded mode
-            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "ollama", "lmstudio", "openai_compatible"], "when": {"mode": "local_embedded"}},
+            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "ollama", "ollama-cloud", "lmstudio", "openai_compatible"], "when": {"mode": "local_embedded"}},
             {"key": "llm_base_url", "description": "Endpoint URL (e.g. http://192.168.1.10:8080/v1)", "default": "", "when": {"mode": "local_embedded", "llm_provider": "openai_compatible"}},
             {"key": "llm_api_key", "description": "LLM API key (optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
@@ -898,7 +922,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in {"openai_compatible", "openrouter"}:
+                if llm_provider in {"openai_compatible", "openrouter", "ollama-cloud"}:
                     llm_provider = "openai"
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
                              self._config.get("profile", "hermes"), llm_provider)
@@ -1513,7 +1537,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, SYNC_RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -1535,6 +1559,28 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_retain failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to store memory: {e}")
+
+        elif tool_name == "hindsight_sync_retain":
+            content = args.get("content", "")
+            if not content:
+                return tool_error("Missing required parameter: content")
+            context = args.get("context")
+            try:
+                retain_kwargs = self._build_retain_kwargs(
+                    content,
+                    context=context,
+                    tags=args.get("tags"),
+                    retain_async=False,
+                )
+                logger.debug("Tool hindsight_sync_retain: bank=%s, content_len=%d, context=%s",
+                             self._bank_id, len(content), context)
+                # retain_async=False blocks until the memory is fully stored and indexed
+                self._run_hindsight_operation(lambda client: client.aretain(**retain_kwargs))
+                logger.debug("Tool hindsight_sync_retain: success")
+                return json.dumps({"result": "Memory stored and indexed successfully."})
+            except Exception as e:
+                logger.warning("hindsight_sync_retain failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to store memory synchronously: {e}")
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
