@@ -1,0 +1,4 @@
+name: hindsight_archive
+version: 1.0.0
+description: "Hindsight Context Archive Engine — archives pre-compression messages to Hindsight before lossy summarization."
+kind: standalone
