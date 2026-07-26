@@ -52,6 +52,7 @@ class ConfigContext:
     current_base_url: str
     user_providers: dict
     custom_providers: list
+    excluded_providers: list = None
 
     def with_overrides(
         self,
@@ -96,12 +97,14 @@ def load_picker_context() -> ConfigContext:
         current_provider = ""
         current_base_url = ""
     raw = cfg.get("providers")
+    excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
         current_base_url=current_base_url,
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
+        excluded_providers=excluded if isinstance(excluded, list) else [],
     )
 
 
@@ -179,6 +182,7 @@ def build_models_payload(
         refresh=refresh,
         probe_custom_providers=probe_custom_providers,
         probe_current_custom_provider=probe_current_custom_provider,
+        excluded_providers=ctx.excluded_providers or [],
     )
 
     moa_row = _moa_provider_row(ctx.current_provider)
@@ -187,6 +191,14 @@ def build_models_payload(
 
     if explicit_only:
         rows = _filter_explicit_provider_rows(rows, ctx)
+        # Desktop chat pickers request the explicit subset without the full
+        # unconfigured provider universe. If the configured current provider
+        # has lost its credential, list_authenticated_providers() omits it;
+        # keep that one row visible so the UI can show the saved selection and
+        # a re-auth affordance instead of appearing to jump to another provider.
+        rows = list(rows) + _append_unconfigured_rows(
+            rows, ctx, current_only=True
+        )
 
     # --- Deduplicate: remove models from aggregators that overlap with
     # user-defined providers.  When a local proxy (e.g. litellm-proxy)
@@ -251,6 +263,38 @@ def build_models_payload(
     }
 
 
+def build_model_options_payload(
+    ctx: ConfigContext,
+    *,
+    explicit_only: bool = False,
+    include_unconfigured: bool = False,
+    refresh: bool = False,
+) -> dict:
+    """Build the shared API-server/dashboard/TUI model-options payload.
+
+    This wraps ``build_models_payload`` with the stable picker shape and the
+    safe custom-provider probe policy used for normal GUI/TUI opens:
+
+    - normal open: probe only the current custom provider so offline saved
+      endpoints do not block the picker
+    - explicit refresh: probe every custom provider while busting the model
+      cache so live catalogs repopulate fully
+    """
+    refresh = bool(refresh)
+    return build_models_payload(
+        ctx,
+        explicit_only=bool(explicit_only),
+        include_unconfigured=bool(include_unconfigured),
+        picker_hints=True,
+        canonical_order=True,
+        pricing=True,
+        capabilities=True,
+        refresh=refresh,
+        probe_custom_providers=refresh,
+        probe_current_custom_provider=not refresh,
+    )
+
+
 def _apply_capabilities(rows: list[dict]) -> None:
     """Attach a ``{model: {fast, reasoning}}`` map to each provider row.
 
@@ -292,15 +336,61 @@ def _apply_capabilities(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
-def _append_unconfigured_rows(rows: list[dict], ctx: ConfigContext) -> list[dict]:
-    """Build skeleton rows for canonical providers missing from ``rows``."""
+def _append_unconfigured_rows(
+    rows: list[dict],
+    ctx: ConfigContext,
+    *,
+    current_only: bool = False,
+) -> list[dict]:
+    """Build fallback rows for canonical providers missing from ``rows``.
+
+    Most missing canonical providers become empty setup skeletons. The one
+    exception is the *current* configured provider: if config.yaml still points
+    at it but credentials are presently unavailable, keep a visible row carrying
+    the saved model so GUI pickers don't silently snap to some other provider.
+    """
+    from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
+    cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
+            continue
+        if current_only and entry.slug.lower() != cur:
+            continue
+        if entry.slug.lower() == cur:
+            cfg = PROVIDER_REGISTRY.get(entry.slug)
+            auth_type = cfg.auth_type if cfg else "api_key"
+            key_env = (
+                cfg.api_key_env_vars[0]
+                if (cfg and cfg.api_key_env_vars)
+                else ""
+            )
+            warning = (
+                f"Configured provider missing usable credentials; paste {key_env} to reactivate. "
+                "Showing the saved model only."
+                if auth_type == "api_key" and key_env
+                else "Configured provider is not authenticated; run `hermes model` to reactivate. "
+                "Showing the saved model only."
+            )
+            extras.append(
+                {
+                    "slug": entry.slug,
+                    "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
+                    "is_current": True,
+                    "is_user_defined": False,
+                    "models": [cur_model] if cur_model else [],
+                    "total_models": 1 if cur_model else 0,
+                    "source": "configured-current",
+                    "authenticated": False,
+                    "auth_type": auth_type,
+                    "key_env": key_env,
+                    "warning": warning,
+                }
+            )
             continue
         extras.append(
             {
@@ -479,6 +569,7 @@ def _apply_pricing(
     from hermes_cli.models import (
         _format_price_per_mtok,
         check_nous_free_tier,
+        compute_sale_discount,
         get_pricing_for_provider,
         partition_nous_models_by_tier,
     )
@@ -511,12 +602,32 @@ def _apply_pricing(
             cache = _format_price_per_mtok(cache_raw) if cache_raw else None
             # A model is "free" when both input and output cost nothing.
             is_free = inp == "free" and (out == "free" or out == "")
-            formatted[mid] = {
+            entry: dict = {
                 "input": inp,
                 "output": out,
                 "cache": cache,
                 "free": is_free,
             }
+            # Sale chrome is Nous Portal-only. Other providers (OpenRouter,
+            # Novita, …) never get discount_percent / was_* even if a nested
+            # pricing.original somehow appeared in their catalog. Free / $0
+            # models never get sale chrome either — even if original leaked.
+            if slug == "nous" and not is_free:
+                sale = compute_sale_discount(
+                    inp_raw, out_raw, p.get("original")
+                )
+                if sale is not None:
+                    discount_percent, was_prompt_raw, was_out_raw = sale
+                    entry["discount_percent"] = discount_percent
+                    if was_prompt_raw != "":
+                        entry["was_input"] = _format_price_per_mtok(
+                            was_prompt_raw
+                        )
+                    if was_out_raw != "":
+                        entry["was_output"] = _format_price_per_mtok(
+                            was_out_raw
+                        )
+            formatted[mid] = entry
 
         if formatted:
             row["pricing"] = formatted
